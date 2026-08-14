@@ -1,28 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-HDRezka Stream API
-- الكوكيز تُحفظ في الذاكرة
-- لا تُجدَّد في كل طلب
-- التجديد فقط عند الحاجة أو انتهاء الصلاحية
-"""
-
 from flask import Flask, request, jsonify
 from curl_cffi import requests as curl_requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote_plus, urlencode
 from itertools import product
-import hashlib
-import base64
-import json
-import re
-import time
-import os
-import threading
+import hashlib, base64, json, re, time, os, threading
 
 app = Flask(__name__)
 
-BASE_URL = os.environ.get("BASE_URL", "https://rezka-ua.tv")
+MIRRORS = [
+    os.environ.get("BASE_URL", "https://rezka-ua.tv"),
+    "https://rezka.ag",
+    "https://hdrezka.ag",
+]
+# إزالة التكرار مع الحفاظ على الترتيب
+_seen = set()
+MIRRORS = [m for m in MIRRORS if not (m in _seen or _seen.add(m))]
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -30,10 +25,10 @@ USER_AGENT = (
 )
 IMPERSONATE = "chrome120"
 
-# ===== جلسة مشتركة =====
 COOKIES = {}
 COOKIE_TS = 0.0
-COOKIE_TTL = int(os.environ.get("COOKIE_TTL", "1800"))  # 30 دقيقة
+BASE_URL = MIRRORS[0]
+COOKIE_TTL = int(os.environ.get("COOKIE_TTL", "1800"))
 _lock = threading.Lock()
 
 
@@ -41,10 +36,22 @@ def is_blocked(text: str) -> bool:
     if not text:
         return True
     t = text.lower()
-    return any(
-        x in t
-        for x in ["проверяем", "anubis_challenge", "что вы не бот", "techaro"]
-    )
+    markers = [
+        "проверяем",
+        "anubis_challenge",
+        "что вы не бот",
+        "techaro",
+        "ошибка доступа",
+        "access denied",
+        "cf-browser-verification",
+    ]
+    if any(x in t for x in markers):
+        return True
+    # صفحة قصيرة بلا نتائج بحث معتادة
+    if "b-content__inline_item" not in text and "b-search__title" not in text:
+        if "doctype" in t and len(text) < 8000 and ("бот" in t or "challenge" in t):
+            return True
+    return False
 
 
 def clear_trash(data: str) -> str:
@@ -52,32 +59,28 @@ def clear_trash(data: str) -> str:
         return ""
     if data.startswith("[") or data.startswith("http"):
         return data
-
     trash_list = ["@", "#", "!", "^", "$"]
-    trash_codes = []
-    for i in range(2, 4):
-        for chars in product(trash_list, repeat=i):
-            trash_codes.append(base64.b64encode("".join(chars).encode()).decode())
-
-    s = data.replace("#h", "")
-    trash_string = "".join(s.split("//_//"))
+    trash_codes = [
+        base64.b64encode("".join(chars).encode()).decode()
+        for i in range(2, 4)
+        for chars in product(trash_list, repeat=i)
+    ]
+    s = "".join(data.replace("#h", "").split("//_//"))
     for code in trash_codes:
-        trash_string = trash_string.replace(code, "")
-
+        s = s.replace(code, "")
     try:
-        pad = "=" * ((4 - len(trash_string) % 4) % 4)
-        return base64.b64decode(trash_string + pad).decode("utf-8", errors="ignore")
+        pad = "=" * ((4 - len(s) % 4) % 4)
+        return base64.b64decode(s + pad).decode("utf-8", errors="ignore")
     except Exception:
         try:
-            return base64.b64decode(trash_string + "==").decode("utf-8", errors="ignore")
+            return base64.b64decode(s + "==").decode("utf-8", errors="ignore")
         except Exception:
-            return trash_string
+            return s
 
 
 def parse_streams(raw_url: str) -> dict:
     streams = {}
-    cleaned = clear_trash(raw_url)
-    for part in cleaned.split(","):
+    for part in clear_trash(raw_url).split(","):
         part = part.strip()
         if "[" not in part or "]" not in part:
             continue
@@ -85,13 +88,13 @@ def parse_streams(raw_url: str) -> dict:
             after = part.split("[", 1)[1]
             quality, urls_part = after.split("]", 1)
             quality = re.sub(r"<[^>]*>", "", quality).strip()
-            url_list = [
+            urls = [
                 u.strip().replace("\\/", "/")
                 for u in urls_part.split(" or ")
                 if u.strip().startswith("http")
             ]
-            if quality and url_list:
-                streams[quality] = url_list
+            if quality and urls:
+                streams[quality] = urls
         except Exception:
             continue
     return streams
@@ -112,7 +115,7 @@ def solve_anubis_pow(random_data: str, difficulty: int = 5):
 def make_session():
     return curl_requests.Session(
         impersonate=IMPERSONATE,
-        cookies=COOKIES,
+        cookies=dict(COOKIES),
         headers={
             "User-Agent": USER_AGENT,
             "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
@@ -120,11 +123,12 @@ def make_session():
     )
 
 
-def renew_cookies() -> bool:
-    """تجديد الكوكيز — يُستدعى فقط عند الحاجة"""
-    global COOKIES, COOKIE_TS
+def renew_cookies(base_url: str = None) -> bool:
+    """تجديد ناجح فقط إذا حصلنا على كوكيز غير فارغة"""
+    global COOKIES, COOKIE_TS, BASE_URL
+    base_url = base_url or BASE_URL
+    print(f"[*] تجديد الكوكيز على {base_url}")
 
-    print("[*] تجديد الكوكيز (Anubis)...")
     s = curl_requests.Session(
         impersonate=IMPERSONATE,
         headers={
@@ -134,18 +138,28 @@ def renew_cookies() -> bool:
         },
     )
     try:
-        r = s.get(BASE_URL + "/", timeout=25)
-        if not is_blocked(r.text):
+        r = s.get(base_url + "/", timeout=25)
+        jar = dict(s.cookies)
+
+        if not is_blocked(r.text) and jar:
             with _lock:
-                COOKIES = dict(s.cookies)
+                COOKIES = jar
                 COOKIE_TS = time.time()
-            print(f"[+] بدون حماية — {len(COOKIES)} كوكي")
+                BASE_URL = base_url
+            print(f"[+] جلسة بدون تحدّي — {len(jar)} كوكي — {base_url}")
             return True
 
         soup = BeautifulSoup(r.text, "html.parser")
         script = soup.find("script", id="anubis_challenge")
         if not script or not script.string:
-            print("[-] لا يوجد anubis_challenge")
+            print("[-] لا anubis_challenge")
+            # حتى لو في كوكيز أولية
+            if jar:
+                with _lock:
+                    COOKIES = jar
+                    COOKIE_TS = time.time()
+                    BASE_URL = base_url
+                return True
             return False
 
         data = json.loads(script.string.strip())
@@ -156,108 +170,114 @@ def renew_cookies() -> bool:
         t0 = time.time()
         hash_hex, nonce = solve_anubis_pow(random_data, difficulty)
         elapsed = int((time.time() - t0) * 1000) + 500
-        print(f"[+] PoW ok nonce={nonce}")
 
         params = {
             "id": challenge_id,
             "response": hash_hex,
             "nonce": str(nonce),
-            "redir": BASE_URL + "/",
+            "redir": base_url + "/",
             "elapsedTime": str(elapsed),
         }
-        pass_url = (
-            f"{BASE_URL}/.within.website/x/cmd/anubis/api/pass-challenge?"
-            f"{urlencode(params)}"
-        )
+        pass_url = f"{base_url}/.within.website/x/cmd/anubis/api/pass-challenge?{urlencode(params)}"
         s.get(
             pass_url,
-            headers={"User-Agent": USER_AGENT, "Referer": BASE_URL + "/"},
+            headers={"User-Agent": USER_AGENT, "Referer": base_url + "/"},
             timeout=20,
             allow_redirects=True,
         )
+        jar = dict(s.cookies)
+
+        if not jar:
+            print("[-] التحدي تم لكن الكوكيز فارغة")
+            return False
 
         with _lock:
-            COOKIES = dict(s.cookies)
+            COOKIES = jar
             COOKIE_TS = time.time()
-
-        ok = bool(COOKIES)
-        print(f"[{'+' if ok else '-'}] كوكيز بعد التجديد: {len(COOKIES)}")
-        return ok
+            BASE_URL = base_url
+        print(f"[+] تم التخطي — {len(jar)} كوكي — {base_url}")
+        return True
     except Exception as e:
         print(f"[-] خطأ Anubis: {e}")
         return False
 
 
 def ensure_cookies(force: bool = False) -> bool:
-    """
-    إبقاء الجلسة مفتوحة.
-    force=True → تجديد إجباري
-    وإلا: جدّد فقط إذا لا كوكيز أو انتهى TTL
-    """
     global COOKIES, COOKIE_TS
     with _lock:
-        need = force or (not COOKIES) or (time.time() - COOKIE_TS > COOKIE_TTL)
-        age = int(time.time() - COOKIE_TS) if COOKIE_TS else -1
+        has = bool(COOKIES)
+        age_ok = COOKIE_TS and (time.time() - COOKIE_TS <= COOKIE_TTL)
+        need = force or (not has) or (not age_ok)
 
     if not need:
-        print(f"[*] استخدام الجلسة الحالية — age={age}s cookies={len(COOKIES)}")
+        print(f"[*] جلسة حالية — cookies={len(COOKIES)}")
         return True
 
-    return renew_cookies()
+    # جرّب كل المرايا حتى تنجح واحدة
+    for mirror in MIRRORS:
+        if renew_cookies(mirror):
+            return True
+    return False
 
 
 def http(method: str, url: str, **kwargs):
-    """طلب مع إعادة محاولة فقط عند الحماية / انتهاء الجلسة"""
     for attempt in range(3):
         s = make_session()
-        if method.upper() == "GET":
-            r = s.get(url, timeout=20, **kwargs)
-        else:
-            r = s.post(url, timeout=20, **kwargs)
-
+        r = s.get(url, timeout=20, **kwargs) if method.upper() == "GET" else s.post(url, timeout=20, **kwargs)
         text = r.text
         expired = "сессии истекло" in text.lower() or (
             '"success":false' in text and "обновите" in text.lower()
         )
-
         if is_blocked(text) or expired:
-            print(f"[!] حماية/جلسة منتهية — تجديد ({attempt + 1})")
+            print(f"[!] حماية/جلسة — تجديد ({attempt + 1})")
             if not ensure_cookies(force=True):
                 raise RuntimeError("فشل تجاوز الحماية")
             continue
+        # حدّث الكوكيز من الرد إن وُجدت
+        try:
+            jar = dict(s.cookies)
+            if jar:
+                with _lock:
+                    COOKIES.update(jar)
+        except Exception:
+            pass
         return r
-
-    raise RuntimeError("فشل الطلب بعد عدة محاولات")
+    raise RuntimeError("فشل الطلب")
 
 
 def search(query: str):
     url = f"{BASE_URL}/search/?do=search&subaction=search&q={quote_plus(query)}"
     r = http("GET", url)
-    soup = BeautifulSoup(r.text, "html.parser")
-    item = (
-        soup.find("div", class_="b-content__inline_item")
-        or soup.select_one(".b-content__inline_item")
+    html = r.text
+    soup = BeautifulSoup(html, "html.parser")
+    item = soup.find("div", class_="b-content__inline_item") or soup.select_one(
+        ".b-content__inline_item"
     )
     if not item:
-        return None
+        return None, {
+            "blocked": is_blocked(html),
+            "title": (soup.title.string if soup.title else None),
+            "len": len(html),
+            "has_item": "b-content__inline_item" in html,
+            "base_url": BASE_URL,
+            "snippet": html[:400],
+        }
 
     movie_url = item.get("data-url")
     if not movie_url:
         a = item.find("a", href=True)
         movie_url = a["href"] if a else None
     if not movie_url:
-        return None
+        return None, {"error": "no data-url", "base_url": BASE_URL}
     if not movie_url.startswith("http"):
         movie_url = BASE_URL + movie_url
-
     title = item.get("data-title") or query
-    return {"title": title, "url": movie_url}
+    return {"title": title, "url": movie_url}, None
 
 
 def get_streams(movie_url: str, season="1", episode="1"):
     r = http("GET", movie_url)
     soup = BeautifulSoup(r.text, "html.parser")
-
     m = re.search(r"/(\d+)-", movie_url)
     if not m:
         raise RuntimeError("فشل استخراج ID")
@@ -266,28 +286,19 @@ def get_streams(movie_url: str, season="1", episode="1"):
     is_series = any(x in movie_url for x in ["/series/", "/cartoons/", "/animation/"])
     action = "get_stream" if is_series else "get_movie"
 
-    translators = []
-    for li in soup.select("li.b-translator__item"):
-        tid = li.get("data-translator_id")
-        if tid:
-            translators.append(tid)
-
     ordered = []
     node = soup.select_one("li.b-translator__item.active")
     if node and node.get("data-translator_id"):
         ordered.append(node["data-translator_id"])
-    for t in translators:
-        if t not in ordered:
-            ordered.append(t)
+    for li in soup.select("li.b-translator__item"):
+        tid = li.get("data-translator_id")
+        if tid and tid not in ordered:
+            ordered.append(tid)
     if not ordered:
         ordered = ["238", "1", "56"]
 
     for tid in ordered:
-        payload = {
-            "id": movie_id,
-            "translator_id": tid,
-            "action": action,
-        }
+        payload = {"id": movie_id, "translator_id": tid, "action": action}
         if is_series:
             payload["season"] = str(season)
             payload["episode"] = str(episode)
@@ -300,39 +311,28 @@ def get_streams(movie_url: str, season="1", episode="1"):
             "Origin": BASE_URL,
             "Referer": movie_url,
         }
-
-        api = http(
-            "POST",
-            f"{BASE_URL}/ajax/get_cdn_series/",
-            data=payload,
-            headers=headers,
-        )
+        api = http("POST", f"{BASE_URL}/ajax/get_cdn_series/", data=payload, headers=headers)
         try:
             data = api.json()
         except Exception:
             continue
-
         if data.get("success") is False:
-            msg = str(data.get("message", ""))
-            if "сессии" in msg.lower():
+            if "сессии" in str(data.get("message", "")).lower():
                 ensure_cookies(force=True)
             continue
-
         if data.get("url"):
             streams = parse_streams(data["url"])
             if streams:
-                subs = [
-                    s.strip()
-                    for s in (data.get("subtitle") or "").replace("\\/", "/").split(",")
-                    if s.strip()
-                ]
                 return {
                     "id": movie_id,
                     "translator_id": tid,
                     "streams": streams,
-                    "subtitles": subs,
+                    "subtitles": [
+                        s.strip()
+                        for s in (data.get("subtitle") or "").replace("\\/", "/").split(",")
+                        if s.strip()
+                    ],
                 }
-
     return None
 
 
@@ -351,9 +351,11 @@ def health():
     return jsonify({
         "status": "ok",
         "cookies": len(COOKIES),
+        "cookie_keys": list(COOKIES.keys()),
         "cookie_age_seconds": age,
         "cookie_ttl": COOKIE_TTL,
         "base_url": BASE_URL,
+        "mirrors": MIRRORS,
     })
 
 
@@ -362,24 +364,39 @@ def api():
     query = (request.args.get("q") or "").strip()
     season = request.args.get("season", "1")
     episode = request.args.get("episode", "1")
-
     if not query:
         return jsonify({"success": False, "error": "q required"}), 400
 
     try:
-        # لا تجديد في كل طلب — فقط إن لزم
         if not ensure_cookies(force=False):
-            return jsonify({"success": False, "error": "فشل تجديد الكوكيز (Anubis)"}), 503
+            return jsonify({
+                "success": False,
+                "error": "فشل تجديد الكوكيز (Anubis)",
+                "hint": "IP الاستضافة قد يكون محظوراً من Rezka",
+            }), 503
 
-        result = search(query)
+        if not COOKIES:
+            return jsonify({
+                "success": False,
+                "error": "جلسة فارغة",
+                "hint": "ensure_cookies نجح شكلياً بلا كوكيز — هذا لا يجب أن يحدث",
+            }), 503
+
+        result, debug = search(query)
         if not result:
-            return jsonify({"success": False, "error": "لا توجد نتائج"}), 404
+            # محاولة مرآة أخرى
+            ensure_cookies(force=True)
+            result, debug = search(query)
+
+        if not result:
+            return jsonify({
+                "success": False,
+                "error": "لا توجد نتائج",
+                "debug": debug,
+            }), 404
 
         info = get_streams(result["url"], season, episode)
-
-        # محاولة واحدة إضافية عند فشل الروابط
         if not info or not info.get("streams"):
-            print("[!] لا روابط — إعادة محاولة بعد تجديد الجلسة")
             ensure_cookies(force=True)
             info = get_streams(result["url"], season, episode)
 
@@ -397,6 +414,7 @@ def api():
             "url": result["url"],
             "id": info["id"],
             "translator_id": info["translator_id"],
+            "mirror": BASE_URL,
             "streams": info["streams"],
             "subtitles": info.get("subtitles") or [],
         })
